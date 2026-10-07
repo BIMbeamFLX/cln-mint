@@ -138,6 +138,26 @@ pub(crate) fn owns_branch(
     schnorr::verify(&schnorr::Signature::from_byte_array(sig), &digest, &pk).is_ok()
 }
 
+/// What a rotation certificate signs: the note this mint burned, the one
+/// note it credited in its place, and that note's value. Its second field
+/// tells it from a note's own certificate, where an amount stands there.
+pub(crate) fn rotation_message(spent_id: &str, note_id: &str, amount_msat: u64) -> String {
+    format!("LNURLcash:rotate:{amount_msat}:{spent_id}:{note_id}")
+}
+
+/// A `cr1`: a `cs1` under its own prefix, so neither is taken for the other.
+/// lnurlcash-core 0.2.3 encodes none and keeps its amount suffix to itself,
+/// so the human-readable part is taken from the `cs1` of the same amount.
+/// This belongs in lnurlcash-core once it exports one.
+pub(crate) fn encode_cr1_with_amount(amount_msat: u64, signature: &[u8; 65]) -> String {
+    use bech32::{Bech32m, Hrp};
+    let cs1 = encode_cs1_with_amount(amount_msat, signature);
+    // no data character is a '1': the last one is the separator
+    let amount = &cs1[2..cs1.rfind('1').expect("a cs1 has a separator")];
+    let hrp = Hrp::parse(&format!("cr{amount}")).expect("a cs1's amount is a valid HRP");
+    bech32::encode::<Bech32m>(hrp, signature).expect("a cr1 is well under 1023 characters")
+}
+
 impl PluginState {
     fn is_own_username(&self, username: &str) -> bool {
         let username = username.to_ascii_lowercase();
@@ -172,6 +192,43 @@ impl PluginState {
                 None
             }
         }
+    }
+
+    /// A `cr1` certificate that the note `spent_id` was burned into the one
+    /// note `note_id`, worth `amount_msat`: where a note came from, which its
+    /// own `cs1` cannot say. An extension, not part of LUD-25. Only ever for
+    /// a rotate: a split has two outputs and a merge several inputs. It is
+    /// this key's statement about this mint's own record of what it burned,
+    /// and no stronger than that record. `None` if signing failed.
+    async fn rotation_certificate(
+        &self,
+        spent_id: &str,
+        note_id: &str,
+        amount_msat: u64,
+    ) -> Option<String> {
+        let message = rotation_message(spent_id, note_id, amount_msat);
+        match self.node.sign_message(&message).await {
+            Ok(sig) => Some(encode_cr1_with_amount(amount_msat, &sig)),
+            Err(e) => {
+                log::warn!("could not certify a rotation: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// A rotate's two certificates, `c` and `r`: the new note's own and the
+    /// rotation's. Asked of the node side by side, so a rotate waits for it
+    /// once, as it did before there was an `r`. Either is `None` on its own.
+    async fn rotate_certificates(
+        &self,
+        spent_id: &str,
+        note_id: &str,
+        amount_msat: u64,
+    ) -> (Option<String>, Option<String>) {
+        tokio::join!(
+            self.certificate(note_id, amount_msat),
+            self.rotation_certificate(spent_id, note_id, amount_msat),
+        )
     }
 
     // ---- payRequest (minting) ----
@@ -506,10 +563,19 @@ impl PluginState {
                         (Some(id2), Some(a2)) => self.certificate(id2, a2).await,
                         _ => None,
                     };
+                    // only a rotate, one note in and one note out, was a rotation
+                    let (c, r) = match (note_ids.as_slice(), &burn.id2) {
+                        ([spent], None) => {
+                            self.rotate_certificates(spent, &burn.id, burn.amount1_msat)
+                                .await
+                        }
+                        _ => (self.certificate(&burn.id, burn.amount1_msat).await, None),
+                    };
                     return Ok(compact(json!({
                         "status": "OK",
-                        "c": self.certificate(&burn.id, burn.amount1_msat).await,
+                        "c": c,
                         "c2": c2,
+                        "r": r,
                     })));
                 }
             }
@@ -553,9 +619,15 @@ impl PluginState {
         // rotate is a merge of one: the refund is 0
         let merged = total + (note_ids.len() as u64 - 1) * s.base_fee_msat;
         self.store.swap(&note_ids, &[(p1_id.clone(), merged)])?;
+        // a merge has no one note to name as the one that became p1
+        let (c, r) = match note_ids.as_slice() {
+            [spent] => self.rotate_certificates(spent, &p1_id, merged).await,
+            _ => (self.certificate(&p1_id, merged).await, None),
+        };
         Ok(compact(json!({
             "status": "OK",
-            "c": self.certificate(&p1_id, merged).await,
+            "c": c,
+            "r": r,
         })))
     }
 
@@ -834,11 +906,336 @@ impl PluginState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use lnurlcash_core::{
-        recoverable::{derive_note_secret_key, encode_cx1},
-        signature::sign_address_proof,
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixListener,
+        path::PathBuf,
     };
+
+    use super::*;
+    use crate::{
+        db::NoteStore,
+        node::Node,
+        structs::test_settings,
+        vectors::{certifies_rotation, cr1_signature, lightning_signed_digest},
+    };
+    use lnurlcash_core::{
+        recoverable::{
+            derive_note_secret_key, encode_ck1, encode_cp1, encode_cx1, sign_note_ownership,
+        },
+        signature::{sign_address_proof, verify_note_signature_hash},
+    };
+    use secp256k1::{Message, SecretKey, ecdsa::RecoverableSignature};
+    use sha2::{Digest, Sha256};
+
+    /// The node key the test nodes sign with.
+    const NODE_KEY: [u8; 32] = [7; 32];
+
+    /// The node id their certificates verify against.
+    fn node_id() -> String {
+        let key = SecretKey::from_secret_bytes(NODE_KEY).unwrap();
+        hex::encode(key.public_key().serialize())
+    }
+
+    /// lightningd's RPC socket, as far as certificates need it. The socket is
+    /// removed once its test is over.
+    struct Lightningd(PathBuf);
+
+    impl Drop for Lightningd {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    impl Lightningd {
+        /// A node that answers `signmessage` as lightningd does, and hangs up
+        /// on anything else and on a message starting with `refused`. If
+        /// `paired`, it answers no request before a second one is in.
+        fn start(refused: Option<&'static str>, paired: bool) -> Self {
+            let name = format!("cln-mint-{}.sock", hex::encode(rand::random::<[u8; 8]>()));
+            let socket = std::env::temp_dir().join(name);
+            let listener = UnixListener::bind(&socket).unwrap();
+            std::thread::spawn(move || {
+                let mut held = None;
+                for stream in listener.incoming() {
+                    let stream = stream.unwrap();
+                    // one request a connection: a line of JSON, then an empty one
+                    let mut request = String::new();
+                    BufReader::new(&stream).read_line(&mut request).unwrap();
+                    if paired && held.is_none() {
+                        held = Some((stream, request));
+                        continue;
+                    }
+                    let both = held.take().into_iter().chain([(stream, request)]);
+                    for (mut stream, request) in both {
+                        if let Some(answer) = Self::answer(&request, refused) {
+                            let answer = format!("{answer}\n\n");
+                            stream.write_all(answer.as_bytes()).unwrap();
+                        }
+                    }
+                }
+            });
+            Lightningd(socket)
+        }
+
+        /// What `signmessage` answers: sha256d of the prefixed message, signed
+        /// with RFC 6979. `None` is a hang-up.
+        fn answer(request: &str, refused: Option<&str>) -> Option<Value> {
+            let request: Value = serde_json::from_str(request).ok()?;
+            let message = request["params"]["message"].as_str()?;
+            let refused = refused.is_some_and(|start| message.starts_with(start));
+            if request["method"] != "signmessage" || refused {
+                return None;
+            }
+            let key = SecretKey::from_secret_bytes(NODE_KEY).unwrap();
+            let digest = Message::from_digest(lightning_signed_digest(message));
+            let (recid, rs) =
+                RecoverableSignature::sign_ecdsa_recoverable(digest, &key).serialize_compact();
+            Some(json!({"result": {
+                "signature": hex::encode(rs),
+                "recid": hex::encode([u8::from(recid)]),
+            }}))
+        }
+    }
+
+    /// A mint with an empty store, on the node behind `socket`.
+    fn mint_at(socket: impl Into<PathBuf>) -> PluginState {
+        PluginState::new(
+            test_settings(),
+            NoteStore::in_memory().unwrap(),
+            Node::new(socket),
+            ([127, 0, 0, 1], 0).into(),
+        )
+    }
+
+    /// A mint whose node signs, with the node id its certificates verify against.
+    fn signing_mint() -> (PluginState, String, Lightningd) {
+        let node = Lightningd::start(None, false);
+        (mint_at(&node.0), node_id(), node)
+    }
+
+    /// A bearer note: its spend (the preimage, hex) and its reference (`h`).
+    fn bearer(seed: u8) -> (String, String) {
+        let preimage = [seed; 32];
+        (hex::encode(preimage), hex::encode(Sha256::digest(preimage)))
+    }
+
+    /// A key-path note: its spend at this mint (`ck1`), its reference (`cp1`)
+    /// and its id, `hex(Q)`.
+    fn key_path(seed: u8) -> (String, String, String) {
+        let secret = [seed; 32];
+        let q = secp256k1::Keypair::from_secret_bytes(secret)
+            .unwrap()
+            .x_only_public_key()
+            .0
+            .to_byte_array();
+        let ck1 = encode_ck1(&sign_note_ownership(&secret, "mint.example").unwrap());
+        (ck1, encode_cp1(&q), hex::encode(q))
+    }
+
+    fn note_id(h: &str) -> String {
+        spend::note_id_of_ref(h).unwrap()
+    }
+
+    /// Credit the note `h` names with `amount_msat`, as a paid mint would.
+    fn credit(state: &PluginState, h: &str, amount_msat: u64) {
+        let payment_hash = hex::encode(Sha256::digest(h.as_bytes()));
+        state
+            .store
+            .create_mint(&payment_hash, "lnbcrt1", amount_msat, &note_id(h))
+            .unwrap();
+        state.store.settle_mint(&payment_hash).unwrap();
+    }
+
+    /// `GET /w/cb` with outputs: a rotate, a split or a merge.
+    async fn swap(
+        state: &PluginState,
+        k1s: &[&str],
+        amount: Option<u64>,
+        p1: &str,
+        p2: Option<&str>,
+    ) -> MintResult<Value> {
+        let k1s: Vec<String> = k1s.iter().map(|k1| k1.to_string()).collect();
+        state
+            .withdraw_callback(&k1s, None, amount, Some(p1), p2, None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_rotate_is_certified_from_note_to_note() {
+        let (state, mint, _node) = signing_mint();
+        let (k1, h) = bearer(1);
+        let (_, hb) = bearer(2);
+        let (_, hc) = bearer(3);
+        credit(&state, &h, 50_000);
+        let rotated = swap(&state, &[&k1], None, &hb, None).await.unwrap();
+        let r = rotated["r"].as_str().unwrap();
+        assert!(r.starts_with("cr500n1"), "{r}");
+        let (spent, new) = (note_id(&h), note_id(&hb));
+        assert!(certifies_rotation(&mint, &spent, &new, 50_000, r));
+        // never another amount, the way back, or a look-alike minted on the side
+        assert!(!certifies_rotation(&mint, &spent, &new, 50_001, r));
+        assert!(!certifies_rotation(&mint, &new, &spent, 50_000, r));
+        assert!(!certifies_rotation(&mint, &spent, &note_id(&hc), 50_000, r));
+        // `c` is the new note's own certificate. Either is refused where the
+        // other belongs by its prefix alone, before any signature is looked at
+        let c = rotated["c"].as_str().unwrap();
+        assert!(verify_note_signature_hash(&new, 50_000, c, &mint));
+        assert!(!verify_note_signature_hash(&new, 50_000, r, &mint));
+        assert!(!certifies_rotation(&mint, &spent, &new, 50_000, c));
+        // and `r`'s bare signature certifies neither of the notes it names
+        let bare = hex::encode(cr1_signature(r).unwrap());
+        assert!(!verify_note_signature_hash(&new, 50_000, &bare, &mint));
+        assert!(!verify_note_signature_hash(&spent, 50_000, &bare, &mint));
+        // no table of its own: an exact retry reads the burn on record and is
+        // signed again, to the same bytes by this deterministic signer
+        let retried = swap(&state, &[&k1], None, &hb, None).await.unwrap();
+        assert_eq!(retried, rotated);
+    }
+
+    #[tokio::test]
+    async fn rotation_certificates_chain_step_by_step() {
+        let (state, mint, _node) = signing_mint();
+        let (k1a, ha) = bearer(1);
+        let (k1b, hb) = bearer(2);
+        let (_, hc) = bearer(3);
+        credit(&state, &ha, 50_000);
+        let ab = swap(&state, &[&k1a], None, &hb, None).await.unwrap();
+        let bc = swap(&state, &[&k1b], None, &hc, None).await.unwrap();
+        let (ab, bc) = (ab["r"].as_str().unwrap(), bc["r"].as_str().unwrap());
+        let (a, b, c) = (note_id(&ha), note_id(&hb), note_id(&hc));
+        let certifies =
+            |r: &str, from: &str, to: &str| certifies_rotation(&mint, from, to, 50_000, r);
+        // each certifies its own step
+        assert!(certifies(ab, &a, &b) && certifies(bc, &b, &c));
+        // and no other: not the step beside it, nor a shortcut past B
+        assert!(!certifies(ab, &b, &c) && !certifies(bc, &a, &b));
+        assert!(!certifies(ab, &a, &c) && !certifies(bc, &a, &c));
+    }
+
+    #[tokio::test]
+    async fn a_key_path_note_is_certified_by_its_output_key() {
+        // a signature spends these notes, no preimage: Q names them all the same
+        let (state, mint, _node) = signing_mint();
+        let (ck1, cp1, q) = key_path(3);
+        let (ck1b, cp1b, qb) = key_path(4);
+        let (_, h) = bearer(5);
+        credit(&state, &cp1, 50_000);
+        let rotated = swap(&state, &[&ck1], None, &cp1b, None).await.unwrap();
+        let r = rotated["r"].as_str().unwrap();
+        assert!(certifies_rotation(&mint, &q, &qb, 50_000, r));
+        // and on from there, into a bearer note
+        let rotated = swap(&state, &[&ck1b], None, &h, None).await.unwrap();
+        let r = rotated["r"].as_str().unwrap();
+        assert!(certifies_rotation(&mint, &qb, &note_id(&h), 50_000, r));
+    }
+
+    #[tokio::test]
+    async fn only_a_rotate_gets_a_rotation_certificate() {
+        let (state, _, _node) = signing_mint();
+        let (k1, h) = bearer(1);
+        let (k1a, ha) = bearer(2);
+        let (k1b, hb) = bearer(3);
+        let (_, hc) = bearer(4);
+        credit(&state, &h, 50_000);
+        // asking about a note rotates nothing
+        let info = state.withdraw_request(Some(&k1), None, None).await.unwrap();
+        assert!(info["c"].is_string() && info.get("r").is_none(), "{info}");
+        // a split: two notes came out of one, and neither is the note it became
+        let split = swap(&state, &[&k1], Some(20_000), &ha, Some(&hb)).await;
+        let split = split.unwrap();
+        assert!(split["c"].is_string() && split["c2"].is_string(), "{split}");
+        assert!(split.get("r").is_none(), "{split}");
+        // a merge: no one note became the new one
+        let merged = swap(&state, &[&k1a, &k1b], None, &hc, None).await.unwrap();
+        assert!(
+            merged["c"].is_string() && merged.get("r").is_none(),
+            "{merged}"
+        );
+        // nor does a retry of either
+        let again = swap(&state, &[&k1], Some(20_000), &ha, Some(&hb)).await;
+        assert_eq!(again.unwrap(), split);
+        let again = swap(&state, &[&k1a, &k1b], None, &hc, None).await;
+        assert_eq!(again.unwrap(), merged);
+        // and neither is replayed as a rotate of one of its notes into one of its outputs
+        for (k1, output) in [(&k1, &ha), (&k1a, &hc)] {
+            let refused = swap(&state, &[k1], None, output, None).await;
+            assert!(matches!(refused, Err(MintError::Reject(r)) if r == spend::INVALID_K1));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rotation_certificate_lost_to_its_signing_comes_with_a_retry() {
+        // a node that signs no rotation, until another answers in its place
+        let down = Lightningd::start(Some("LNURLcash:rotate:"), false);
+        let (state, mint) = (mint_at(&down.0), node_id());
+        let (k1, h) = bearer(1);
+        let (_, hb) = bearer(2);
+        credit(&state, &h, 50_000);
+        // the rotate stands and the new note is certified, without its `r`
+        let first = swap(&state, &[&k1], None, &hb, None).await.unwrap();
+        assert!(
+            first["c"].is_string() && first.get("r").is_none(),
+            "{first}"
+        );
+        // the same request again is how the rest is had
+        let up = Lightningd::start(None, false);
+        let state = PluginState {
+            node: Node::new(&up.0),
+            ..state
+        };
+        let retried = swap(&state, &[&k1], None, &hb, None).await.unwrap();
+        assert_eq!(retried["c"], first["c"]);
+        let r = retried["r"].as_str().unwrap();
+        assert!(certifies_rotation(
+            &mint,
+            &note_id(&h),
+            &note_id(&hb),
+            50_000,
+            r
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rotate_waits_for_the_node_once() {
+        // this node answers no request before a second one is in: asked for
+        // one after the other, a rotate's certificates would never come
+        let node = Lightningd::start(None, true);
+        let (state, mint) = (mint_at(&node.0), node_id());
+        let (k1, h) = bearer(1);
+        let (_, hb) = bearer(2);
+        credit(&state, &h, 50_000);
+        // the rotate, then its retry
+        let k1s = [k1.as_str()];
+        for _ in 0..2 {
+            let rotate = swap(&state, &k1s, None, &hb, None);
+            let rotated = tokio::time::timeout(Duration::from_secs(5), rotate).await;
+            let rotated = rotated.expect("both are asked for at once").unwrap();
+            let c = rotated["c"].as_str().unwrap();
+            let r = rotated["r"].as_str().unwrap();
+            assert!(verify_note_signature_hash(&note_id(&hb), 50_000, c, &mint));
+            assert!(certifies_rotation(
+                &mint,
+                &note_id(&h),
+                &note_id(&hb),
+                50_000,
+                r
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rotate_no_one_could_sign_still_stands() {
+        // no node behind the socket, no signature: the note moved all the same
+        let state = mint_at("/nonexistent/lightning-rpc");
+        let (k1, h) = bearer(1);
+        let (_, hb) = bearer(2);
+        credit(&state, &h, 50_000);
+        let rotated = swap(&state, &[&k1], None, &hb, None).await.unwrap();
+        assert_eq!(rotated, json!({"status": "OK"}));
+        let new = state.store.note_record(&note_id(&hb)).unwrap().unwrap();
+        assert_eq!((new.amount_msat, new.spent), (50_000, false));
+    }
 
     #[test]
     fn usernames() {

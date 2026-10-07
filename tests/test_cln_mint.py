@@ -126,10 +126,11 @@ def test_bearer_note_lifecycle(node_factory, get_plugin):  # noqa: F811
     assert "k1" not in by_hash and by_hash["maxWithdrawable"] == 99_000
     assert ok(get(local(url, invoice["verify"])))["settled"] is True
 
-    # rotate, and a retry of it gets the same answer
+    # rotate, and a retry of it gets the same answer, rotation certificate included
     k2, h2 = bearer()
     rotated = ok(get(f"{url}/w/cb", {"k1": k1, "p1": h2}))
-    assert ok(get(f"{url}/w/cb", {"k1": k1, "p1": h2}))["c"] == rotated["c"]
+    assert rotated["c"].startswith("cs990n1") and rotated["r"].startswith("cr990n1")
+    assert ok(get(f"{url}/w/cb", {"k1": k1, "p1": h2})) == rotated
     error(get(f"{url}/w", {"k1": k1}), "Note already spent.")
     error(get(f"{url}/w/cb", {"k1": k1, "p1": bearer()[1]}), "Invalid or already spent k1.")
     assert value(url, k1=k2) == 99_000
@@ -138,7 +139,7 @@ def test_bearer_note_lifecycle(node_factory, get_plugin):  # noqa: F811
     (k3, h3), (k4, h4) = bearer(), bearer()
     error(get(f"{url}/w/cb", {"k1": k2, "amount": 40_000, "p1": h3}), "missing p2")
     split = ok(get(f"{url}/w/cb", {"k1": k2, "amount": 40_000, "p1": h3, "p2": h4}))
-    assert "c" in split and "c2" in split
+    assert "c" in split and "c2" in split and "r" not in split
     assert value(url, k1=k3) == 40_000
     assert value(url, k1=k4) == 99_000 - 40_000 - BASE_FEE_MSAT
 
@@ -146,9 +147,9 @@ def test_bearer_note_lifecycle(node_factory, get_plugin):  # noqa: F811
     error(get(f"{url}/w/cb", {"k1": k3, "p1": h4}), "already in use")
     assert value(url, k1=k3) == 40_000
 
-    # merge refunds (n - 1) base fees
+    # merge refunds (n - 1) base fees, and like a split is no rotation
     k5, h5 = bearer()
-    ok(get(f"{url}/w/cb", {"k1": [k3, k4], "p1": h5}))
+    assert "r" not in ok(get(f"{url}/w/cb", {"k1": [k3, k4], "p1": h5}))
     assert value(url, k1=k5) == 99_000
 
     # p is never accepted at the callback
